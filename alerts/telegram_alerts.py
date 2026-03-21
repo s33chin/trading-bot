@@ -1,6 +1,10 @@
 """
 Telegram alert system.
-Sends trade notifications, errors, and daily summaries.
+Sends notifications for every meaningful bot decision:
+- New market window found
+- Trade decisions (execute or skip, with reasoning)
+- Market resolution (UP/DOWN winner, P&L)
+- Errors and daily summaries
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ from typing import Optional
 
 from config import AlertLevel, Config
 from logger import get_logger
-from models import DailyStats, FusedSignal, Trade
+from models import BTCWindow, DailyStats, FusedSignal, Market, Side, Trade
 
 log = get_logger("alerts.telegram")
 
@@ -46,8 +50,10 @@ class TelegramAlerter:
     async def stop(self) -> None:
         self._bot = None
 
+    # ── Trade Decision Notifications ──────────────────────
+
     async def send_trade(self, trade: Trade) -> None:
-        """Send a trade notification."""
+        """Send when a trade is executed."""
         if not self._should_send("trade"):
             return
 
@@ -66,12 +72,9 @@ class TelegramAlerter:
         await self._send(msg)
 
     async def send_signal(self, signal: FusedSignal) -> None:
-        """Send a signal notification (when a trade decision is made)."""
+        """Send when a trade signal is generated (before execution)."""
         if not self._should_send("trade"):
             return
-
-        if signal.action.value == "skip":
-            return  # Don't alert on skips
 
         direction = signal.direction.value.upper() if signal.direction else "N/A"
         msg = (
@@ -82,6 +85,100 @@ class TelegramAlerter:
             f"└ Reason: {signal.reason}"
         )
         await self._send(msg)
+
+    async def send_skip(
+        self,
+        market: Market,
+        reason: str,
+        btc_window: BTCWindow,
+        confidence: Optional[float] = None,
+    ) -> None:
+        """Send when the bot decides NOT to trade a window."""
+        if not self._should_send("trade"):
+            return
+
+        delta_str = f"{btc_window.delta_pct:+.4f}%" if btc_window.delta_pct is not None else "N/A"
+        conf_str = f"{confidence:.1%}" if confidence is not None else "N/A"
+
+        msg = (
+            f"⏭️ <b>Window Skipped</b>\n"
+            f"├ Market: <code>{market.slug}</code>\n"
+            f"├ BTC Delta: <code>{delta_str}</code>\n"
+            f"├ Best Confidence: <code>{conf_str}</code>\n"
+            f"└ Reason: {reason}"
+        )
+        await self._send(msg)
+
+    # ── Market Resolution ─────────────────────────────────
+
+    async def send_resolution(
+        self,
+        market: Market,
+        winner: Side,
+        btc_window: BTCWindow,
+        trades: list[Trade],
+    ) -> None:
+        """
+        Send when a 15-min market resolves.
+        Shows the winner (UP/DOWN), BTC delta, and trade results.
+        """
+        if not self._should_send("trade"):
+            return
+
+        emoji = "🟩" if winner == Side.UP else "🟥"
+        delta_str = f"{btc_window.delta_pct:+.4f}%" if btc_window.delta_pct is not None else "N/A"
+        open_str = f"${btc_window.window_open_price:,.0f}" if btc_window.window_open_price else "N/A"
+        close_str = f"${btc_window.current_price:,.0f}" if btc_window.current_price else "N/A"
+
+        msg = (
+            f"{emoji} <b>Market Resolved: {winner.value.upper()}</b>\n"
+            f"├ Market: <code>{market.slug}</code>\n"
+            f"├ BTC Open: <code>{open_str}</code>\n"
+            f"├ BTC Close: <code>{close_str}</code>\n"
+            f"├ Delta: <code>{delta_str}</code>\n"
+        )
+
+        if trades:
+            total_pnl = sum(t.pnl for t in trades if t.pnl is not None)
+            wins = sum(1 for t in trades if (t.pnl or 0) > 0)
+            losses = len(trades) - wins
+            pnl_emoji = "💰" if total_pnl >= 0 else "💸"
+
+            msg += (
+                f"├ Trades: <code>{len(trades)}</code> ({wins}W / {losses}L)\n"
+                f"└ {pnl_emoji} Window P&L: <code>${total_pnl:+.4f}</code>"
+            )
+        else:
+            msg += f"└ No trades placed this window"
+
+        await self._send(msg)
+
+    async def send_resolution_no_winner(self, market: Market) -> None:
+        """Send when the bot can't determine the winner."""
+        if not self._should_send("trade"):
+            return
+
+        msg = (
+            f"⚠️ <b>Market Resolved — Unknown Winner</b>\n"
+            f"├ Market: <code>{market.slug}</code>\n"
+            f"└ Could not determine BTC direction"
+        )
+        await self._send(msg)
+
+    # ── Market Lifecycle ──────────────────────────────────
+
+    async def send_market_found(self, question: str, seconds_remaining: float) -> None:
+        """Notify when a new market window is found."""
+        if not self._should_send("trade"):
+            return
+        msg = (
+            f"🔍 <b>New Market</b>\n"
+            f"├ {question}\n"
+            f"└ Closes in: <code>{seconds_remaining:.0f}s</code>"
+        )
+        await self._send(msg)
+
+    # ── System Notifications ──────────────────────────────
 
     async def send_error(self, component: str, error: str) -> None:
         """Send an error alert."""
@@ -130,17 +227,6 @@ class TelegramAlerter:
     async def send_shutdown(self, reason: str = "manual") -> None:
         """Send bot shutdown notification."""
         msg = f"🛑 <b>Bot Stopped</b>\n└ Reason: {reason}"
-        await self._send(msg)
-
-    async def send_market_found(self, question: str, seconds_remaining: float) -> None:
-        """Notify when a new market window is found."""
-        if not self._should_send("trade"):
-            return
-        msg = (
-            f"🔍 <b>New Market</b>\n"
-            f"├ {question}\n"
-            f"└ Closes in: <code>{seconds_remaining:.0f}s</code>"
-        )
         await self._send(msg)
 
     # ── Internal ──────────────────────────────────────────

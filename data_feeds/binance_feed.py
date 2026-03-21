@@ -36,8 +36,10 @@ class BinanceFeed:
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
+        self._ws_connected = False
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
+        self._rest_poll_interval = 2.0  # seconds between REST polls
 
     @property
     def last_price(self) -> Optional[BTCPrice]:
@@ -48,10 +50,17 @@ class BinanceFeed:
         self._callbacks.append(callback)
 
     async def start(self) -> None:
-        """Start the price feed."""
+        """Start the price feed — WebSocket primary, REST fallback."""
         self._running = True
         self._session = aiohttp.ClientSession()
+
+        # Fetch an initial price via REST immediately so we have data right away
+        await self.get_price_rest()
+
+        # Start both loops — REST polls continuously as a safety net,
+        # WS provides low-latency updates when connected
         asyncio.create_task(self._ws_loop())
+        asyncio.create_task(self._rest_poll_loop())
         log.info("binance_feed_started")
 
     async def stop(self) -> None:
@@ -123,6 +132,41 @@ class BinanceFeed:
 
     # ── internal ──────────────────────────────────────────
 
+    async def _rest_poll_loop(self) -> None:
+        """
+        Continuous REST polling fallback.
+        Always runs — provides data even when WebSocket is down.
+        Polls more frequently when WS is disconnected.
+        """
+        while self._running:
+            try:
+                interval = 10.0 if self._ws_connected else self._rest_poll_interval
+                await asyncio.sleep(interval)
+
+                if not self._running:
+                    break
+
+                price = await self.get_price_rest()
+                if price:
+                    # Fire callbacks (same as WS would)
+                    for cb in self._callbacks:
+                        try:
+                            cb(price)
+                        except Exception as e:
+                            log.error("rest_callback_error", error=str(e))
+
+                    if not self._ws_connected:
+                        log.debug(
+                            "rest_poll_price",
+                            price=f"${price.price:.2f}",
+                            ws_connected=False,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning("rest_poll_error", error=str(e))
+                await asyncio.sleep(5)
+
     async def _ws_loop(self) -> None:
         """Main WebSocket loop with automatic reconnection."""
         while self._running:
@@ -134,6 +178,7 @@ class BinanceFeed:
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as ws:
                     self._ws = ws
+                    self._ws_connected = True
                     self._reconnect_delay = 1.0
                     log.info("binance_ws_connected")
 
@@ -157,6 +202,7 @@ class BinanceFeed:
                     delay=self._reconnect_delay,
                 )
 
+            self._ws_connected = False
             if self._running:
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(
