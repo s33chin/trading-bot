@@ -371,9 +371,28 @@ class TradingBot:
                 )
 
         # ── Directional (only if we haven't traded this window) ──
+        paper_force = not self.config.is_live and self.config.paper_force_fusion
+
         if not has_directional and best_signal is None:
 
-            if strategy_name in (Strategy.MOMENTUM, Strategy.ALL):
+            # In paper+force_fusion mode, evaluate fusion first and prefer it
+            if paper_force or strategy_name in (Strategy.FUSION, Strategy.ALL):
+                fusion_signal = self.fusion.evaluate(
+                    market, self._current_window, up_book, down_book, klines
+                )
+                if fusion_signal.action != TradeAction.SKIP:
+                    best_signal = fusion_signal
+                elif paper_force and fusion_signal.direction and fusion_signal.confidence >= self.config.min_fusion_confidence:
+                    # Fusion returned SKIP (e.g. token too expensive) but confidence
+                    # is above threshold — in paper mode, override and trade anyway
+                    best_signal = fusion_signal
+                    best_signal.action = (
+                        TradeAction.BUY_UP if fusion_signal.direction == Side.UP else TradeAction.BUY_DOWN
+                    )
+                    best_signal.reason += " [paper_force_fusion override]"
+
+            # Only fall back to momentum if fusion didn't produce a trade
+            if best_signal is None and strategy_name in (Strategy.MOMENTUM, Strategy.ALL):
                 mom_signal = self.momentum.evaluate(
                     market, self._current_window, up_book, down_book
                 )
@@ -386,22 +405,16 @@ class TradingBot:
                         reason="momentum",
                     )
 
-            if strategy_name in (Strategy.FUSION, Strategy.ALL):
-                fusion_signal = self.fusion.evaluate(
-                    market, self._current_window, up_book, down_book, klines
-                )
-                if fusion_signal.action != TradeAction.SKIP:
-                    if best_signal is None or fusion_signal.confidence > best_signal.confidence:
-                        best_signal = fusion_signal
-
         # ── Boost confidence using observation history ──
         if best_signal and best_signal.direction and self._observation_snapshots:
             best_signal = self._apply_observation_boost(best_signal)
 
         # ── Force trade at T-5s if we have any signal at all ──
-        # Better to trade at low confidence than miss the window entirely
+        # In paper+force_fusion: trade if fusion confidence is met
+        # Otherwise: trade at low confidence rather than miss the window
         if best_signal and best_signal.action == TradeAction.SKIP and remaining < 5:
-            if best_signal.confidence > 0.3 and best_signal.direction:
+            min_force_conf = self.config.min_fusion_confidence if paper_force else 0.3
+            if best_signal.confidence >= min_force_conf and best_signal.direction:
                 best_signal.action = (
                     TradeAction.BUY_UP
                     if best_signal.direction == Side.UP
@@ -413,6 +426,7 @@ class TradingBot:
                     direction=best_signal.direction.value,
                     confidence=f"{best_signal.confidence:.2%}",
                     remaining=f"{remaining:.0f}s",
+                    paper_force=paper_force,
                 )
 
         # ── Always push signal confidence to Prometheus ──

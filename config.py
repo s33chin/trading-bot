@@ -78,6 +78,10 @@ class Config(BaseSettings):
         le=5.0,
         description="Simulated slippage as a percentage of price (0.0 = no slippage)",
     )
+    paper_force_fusion: bool = Field(
+        default=True,
+        description="In paper mode, always trade via fusion every window if confidence is met",
+    )
 
     # --- Data Sources ---
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
