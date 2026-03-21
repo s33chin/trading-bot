@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  # ── Trading Bot ────────────────────────────────────────
+  bot:
+    build: .
+    container_name: polybot
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"  # Prometheus metrics
+    depends_on:
+      - prometheus
+    networks:
+      - polybot-net
+    # Override for live trading:
+    # command: ["python", "main.py", "--live"]
+
+  # ── Prometheus ─────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: polybot-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - polybot-net
+
+  # ── Grafana ────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: polybot-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - polybot-net
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  polybot-net:
+    driver: bridge
