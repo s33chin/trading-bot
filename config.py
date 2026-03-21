@@ -9,7 +9,7 @@ import os
 from enum import Enum
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -71,6 +71,14 @@ class Config(BaseSettings):
     take_profit_pct: float = Field(default=0.20, ge=0.05, le=0.50)
     loss_cooldown_seconds: int = Field(default=120, ge=0, le=600)
 
+    # --- Paper Trading ---
+    paper_slippage_pct: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=5.0,
+        description="Simulated slippage as a percentage of price (0.0 = no slippage)",
+    )
+
     # --- Data Sources ---
     binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
     binance_rest_url: str = "https://api.binance.com/api/v3"
@@ -95,6 +103,22 @@ class Config(BaseSettings):
         if v < 0:
             raise ValueError("Signal weights must be non-negative")
         return v
+
+    @model_validator(mode="after")
+    def validate_fusion_weights_sum(self) -> "Config":
+        weight_sum = (
+            self.weight_delta
+            + self.weight_orderbook
+            + self.weight_volatility
+            + self.weight_momentum
+        )
+        if abs(weight_sum - 1.0) > 0.01:
+            raise ValueError(
+                f"Fusion strategy weights must sum to 1.0, got {weight_sum:.4f} "
+                f"(delta={self.weight_delta}, orderbook={self.weight_orderbook}, "
+                f"volatility={self.weight_volatility}, momentum={self.weight_momentum})"
+            )
+        return self
 
     @property
     def fusion_weights_sum(self) -> float:
@@ -129,11 +153,13 @@ class Config(BaseSettings):
             issues.append("Missing Polymarket API credentials")
         if not self.polymarket_proxy_address:
             issues.append("Missing proxy wallet address")
-        if abs(self.fusion_weights_sum - 1.0) > 0.01:
-            issues.append(
-                f"Fusion weights sum to {self.fusion_weights_sum:.2f}, should be 1.0"
-            )
         return issues
+
+    @property
+    def has_plaintext_credentials(self) -> bool:
+        """Check if credentials are loaded from a plaintext .env file."""
+        env_path = Path(".env")
+        return env_path.exists() and self.has_polymarket_credentials
 
     def __str__(self) -> str:
         return (

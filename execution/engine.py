@@ -7,6 +7,8 @@ Uses py-clob-client for real Polymarket CLOB orders.
 
 from __future__ import annotations
 
+import asyncio
+import random
 import time
 import uuid
 from typing import Optional
@@ -25,6 +27,13 @@ from models import (
 )
 
 log = get_logger("execution")
+
+# How long to wait for an order to fill before considering it timed out
+ORDER_FILL_TIMEOUT_SECONDS = 30
+# How many times to poll for fill status
+ORDER_FILL_POLL_ATTEMPTS = 6
+# Delay between fill status polls
+ORDER_FILL_POLL_INTERVAL = 5
 
 
 class ExecutionEngine:
@@ -194,7 +203,16 @@ class ExecutionEngine:
                     status=filled_down.status.value,
                     msg="attempting to cancel UP order",
                 )
-                # TODO: cancel the UP order to unwind
+                cancelled = await self._cancel_order(filled_up)
+                if cancelled:
+                    filled_up.status = TradeStatus.CANCELLED
+                    log.info("arb_up_leg_cancelled", order_id=filled_up.order_id)
+                else:
+                    log.error(
+                        "arb_up_leg_cancel_failed",
+                        order_id=filled_up.order_id,
+                        msg="ORPHANED POSITION — manual intervention required",
+                    )
                 return [filled_up, filled_down]
 
             return [filled_up, filled_down]
@@ -202,7 +220,7 @@ class ExecutionEngine:
             return [self._simulate_fill(up_trade), self._simulate_fill(down_trade)]
 
     async def _place_live_order(self, trade: Trade) -> Trade:
-        """Place a real order on Polymarket CLOB."""
+        """Place a real order on Polymarket CLOB and verify fill."""
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
 
@@ -218,21 +236,24 @@ class ExecutionEngine:
                 signed_order, order_type=OrderType.GTC
             )
 
-            if response and response.get("success"):
-                trade.order_id = response.get("orderID", "")
-                trade.status = TradeStatus.FILLED
-                trade.fill_price = trade.price
-                log.info(
-                    "live_order_placed",
-                    order_id=trade.order_id,
-                    side=trade.side.value,
-                    price=f"${trade.price:.4f}",
-                    shares=f"{trade.shares:.1f}",
-                )
-            else:
+            if not response or not response.get("success"):
                 trade.status = TradeStatus.FAILED
                 error_msg = response.get("errorMsg", "unknown") if response else "no response"
                 log.error("live_order_failed", error=error_msg)
+                return trade
+
+            trade.order_id = response.get("orderID", "")
+            trade.status = TradeStatus.PENDING
+            log.info(
+                "live_order_placed",
+                order_id=trade.order_id,
+                side=trade.side.value,
+                price=f"${trade.price:.4f}",
+                shares=f"{trade.shares:.1f}",
+            )
+
+            # Poll for fill status
+            trade = await self._wait_for_fill(trade)
 
         except Exception as e:
             trade.status = TradeStatus.FAILED
@@ -240,17 +261,120 @@ class ExecutionEngine:
 
         return trade
 
+    async def _wait_for_fill(self, trade: Trade) -> Trade:
+        """
+        Poll the CLOB for order fill status up to a timeout.
+        If the order is not filled within the timeout, cancel it.
+        """
+        if not trade.order_id:
+            trade.status = TradeStatus.FAILED
+            return trade
+
+        for attempt in range(ORDER_FILL_POLL_ATTEMPTS):
+            await asyncio.sleep(ORDER_FILL_POLL_INTERVAL)
+            try:
+                order_info = self._clob_client.get_order(trade.order_id)
+                if not order_info:
+                    continue
+
+                status = order_info.get("status", "").lower()
+                if status in ("matched", "filled"):
+                    trade.status = TradeStatus.FILLED
+                    trade.fill_price = float(order_info.get("associate_trades", [{}])[0].get("price", trade.price))
+                    log.info(
+                        "order_filled",
+                        order_id=trade.order_id,
+                        fill_price=f"${trade.fill_price:.4f}",
+                        attempt=attempt + 1,
+                    )
+                    return trade
+                elif status in ("cancelled", "expired"):
+                    trade.status = TradeStatus.CANCELLED
+                    log.warning("order_cancelled_externally", order_id=trade.order_id)
+                    return trade
+
+                log.debug(
+                    "order_pending",
+                    order_id=trade.order_id,
+                    status=status,
+                    attempt=attempt + 1,
+                    max_attempts=ORDER_FILL_POLL_ATTEMPTS,
+                )
+
+            except Exception as e:
+                log.warning("fill_check_error", order_id=trade.order_id, error=str(e))
+
+        # Timed out — cancel the order
+        log.warning(
+            "order_fill_timeout",
+            order_id=trade.order_id,
+            timeout_seconds=ORDER_FILL_TIMEOUT_SECONDS,
+        )
+        cancelled = await self._cancel_order(trade)
+        trade.status = TradeStatus.CANCELLED if cancelled else TradeStatus.FAILED
+        return trade
+
+    async def _cancel_order(self, trade: Trade) -> bool:
+        """
+        Cancel an open order on the CLOB.
+        Returns True if cancellation succeeded or order was already gone.
+        """
+        if not trade.order_id:
+            return False
+
+        try:
+            response = self._clob_client.cancel(trade.order_id)
+            if response and (response.get("canceled") or response.get("success")):
+                log.info("order_cancelled", order_id=trade.order_id)
+                return True
+
+            # Check if the order no longer exists (already filled/cancelled)
+            order_info = self._clob_client.get_order(trade.order_id)
+            if order_info:
+                status = order_info.get("status", "").lower()
+                if status in ("cancelled", "expired"):
+                    return True
+                log.warning(
+                    "cancel_unexpected_status",
+                    order_id=trade.order_id,
+                    status=status,
+                )
+            return False
+
+        except Exception as e:
+            log.error("cancel_order_exception", order_id=trade.order_id, error=str(e))
+            return False
+
     def _simulate_fill(self, trade: Trade) -> Trade:
-        """Simulate a paper trade fill."""
+        """
+        Simulate a paper trade fill with configurable slippage.
+
+        Slippage is applied as a random adverse price movement up to
+        paper_slippage_pct of the order price. For BUY orders, slippage
+        increases the fill price (worse for buyer).
+        """
+        slippage_pct = self.config.paper_slippage_pct / 100.0
+        if slippage_pct > 0:
+            # Random slippage from 0 to max — always adverse (higher fill for buys)
+            slippage = trade.price * random.uniform(0, slippage_pct)
+            trade.fill_price = min(trade.price + slippage, 0.99)
+        else:
+            trade.fill_price = trade.price
+
+        # Recalculate shares based on actual fill price
+        if trade.fill_price > 0:
+            trade.shares = trade.size / trade.fill_price
+
         trade.status = TradeStatus.FILLED
-        trade.fill_price = trade.price
         trade.order_id = f"paper-{trade.id}"
         self._paper_trades.append(trade)
 
         log.info(
             "paper_trade_filled",
             side=trade.side.value,
-            price=f"${trade.price:.4f}",
+            order_price=f"${trade.price:.4f}",
+            fill_price=f"${trade.fill_price:.4f}",
+            slippage=f"${(trade.fill_price - trade.price):.4f}" if slippage_pct > 0 else "$0",
             shares=f"{trade.shares:.1f}",
             cost=f"${trade.cost:.4f}",
             strategy=trade.strategy.value,

@@ -69,6 +69,8 @@ class TradingBot:
         self._all_trades: list[Trade] = []
         self._daily_stats = DailyStats(date=date.today().isoformat())
         self._observation_snapshots: list[dict] = []
+        # Max snapshots per window: 15min / 5s polling = 180, with headroom
+        self._max_observation_snapshots = 250
 
         # BTC price callback
         self.binance.on_price(self._on_btc_price)
@@ -78,6 +80,14 @@ class TradingBot:
         setup_logging(self.config.log_level)
 
         log.info("bot_starting", config=str(self.config))
+
+        # Warn about plaintext credentials
+        if self.config.has_plaintext_credentials:
+            log.warning(
+                "plaintext_credentials_detected",
+                msg="Private keys loaded from .env file. "
+                "For production, use a secrets manager (AWS Secrets Manager, HashiCorp Vault, etc.)",
+            )
 
         # Validate config for live trading
         if self.config.is_live:
@@ -280,6 +290,8 @@ class TradingBot:
             "volatility": self._current_window.volatility,
         }
         self._observation_snapshots.append(snapshot)
+        if len(self._observation_snapshots) > self._max_observation_snapshots:
+            self._observation_snapshots = self._observation_snapshots[-self._max_observation_snapshots:]
 
         # Push a preliminary confidence estimate to Grafana during observation
         # so the Signal Confidence chart isn't empty for 14+ minutes

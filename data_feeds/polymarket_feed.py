@@ -79,18 +79,24 @@ class PolymarketFeed:
         market = await self._find_by_slug_candidates()
         if market:
             return market
+        log.info("market_discovery_slug_failed", msg="slug candidates exhausted, trying prefix search")
 
         # Approach 2: Search Gamma /markets with slug prefix
         market = await self._find_by_slug_prefix_search()
         if market:
             return market
+        log.info("market_discovery_prefix_failed", msg="prefix search found nothing, trying events search")
 
         # Approach 3: Search Gamma /events for crypto 15-min
         market = await self._find_by_events_search()
         if market:
             return market
 
-        log.warning("no_active_btc_15m_market_found", approaches_tried=3)
+        log.warning(
+            "no_active_btc_15m_market_found",
+            approaches_tried=3,
+            msg="all 3 discovery approaches failed — market may not exist yet or API format changed",
+        )
         return None
 
     async def find_market_by_timestamp(self) -> Optional[Market]:
@@ -150,18 +156,33 @@ class PolymarketFeed:
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status != 200:
+                    log.debug("slug_lookup_http_error", slug=slug, status=resp.status)
                     return None
 
                 data = await resp.json()
                 markets = data if isinstance(data, list) else [data] if data else []
+
+                if not markets:
+                    return None
 
                 for m in markets:
                     parsed = self._parse_gamma_market(m)
                     if parsed:
                         return parsed
 
+                log.debug(
+                    "slug_found_but_unparseable",
+                    slug=slug,
+                    market_count=len(markets),
+                    first_market_keys=list(markets[0].keys())[:10] if markets and isinstance(markets[0], dict) else [],
+                )
+
+        except asyncio.TimeoutError:
+            log.debug("slug_lookup_timeout", slug=slug)
+        except aiohttp.ClientError as e:
+            log.debug("slug_lookup_network_error", slug=slug, error=str(e))
         except Exception as e:
-            log.debug("slug_lookup_miss", slug=slug, error=str(e))
+            log.warning("slug_lookup_unexpected_error", slug=slug, error=str(e), error_type=type(e).__name__)
 
         return None
 
@@ -300,16 +321,18 @@ class PolymarketFeed:
         - neg_risk: boolean
         """
         if not m:
+            log.warning("market_parse_empty_input")
             return None
-
-        # Skip closed/inactive
-        if m.get("closed") is True:
-            return None
-        # Note: 'active' might be False for just-created markets,
-        # so we don't filter on it aggressively here
 
         slug = m.get("slug", "")
         question = m.get("question", "")
+
+        # Skip closed/inactive
+        if m.get("closed") is True:
+            log.debug("market_parse_skip_closed", slug=slug)
+            return None
+        # Note: 'active' might be False for just-created markets,
+        # so we don't filter on it aggressively here
 
         # == Extract token IDs ==
         up_token = None
@@ -372,13 +395,30 @@ class PolymarketFeed:
                     log.debug("token_assignment_assumed", slug=slug)
 
         if not up_token or not down_token:
-            log.debug("market_missing_tokens", slug=slug, question=question[:60])
+            available_keys = [k for k in m.keys() if "token" in k.lower() or "clob" in k.lower() or "outcome" in k.lower()]
+            log.warning(
+                "market_missing_tokens",
+                slug=slug,
+                question=question[:60],
+                up_found=bool(up_token),
+                down_found=bool(down_token),
+                token_related_keys=available_keys,
+                has_tokens_array=bool(m.get("tokens")),
+                has_clobTokenIds=bool(m.get("clobTokenIds") or m.get("clob_token_ids")),
+                has_outcomes=bool(m.get("outcomes")),
+            )
             return None
 
         # == Extract timestamps ==
         end_ts = self._extract_end_timestamp(m, slug)
         if not end_ts:
-            log.debug("market_missing_end_date", slug=slug)
+            date_keys = [k for k in m.keys() if "date" in k.lower() or "time" in k.lower() or "end" in k.lower()]
+            log.warning(
+                "market_missing_end_date",
+                slug=slug,
+                date_related_keys=date_keys,
+                raw_end_date=m.get("end_date_iso") or m.get("endDate") or m.get("end_date"),
+            )
             return None
 
         start_ts = end_ts - 900  # 15-minute window
