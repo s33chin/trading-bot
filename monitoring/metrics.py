@@ -96,6 +96,20 @@ class Metrics:
             "Current USDC balance",
         )
 
+        # Active Trading
+        self.open_positions = Gauge(
+            "polybot_open_positions",
+            "Number of currently open positions",
+        )
+        self.positions_closed_tp = Counter(
+            "polybot_positions_closed_tp_total",
+            "Positions closed by take-profit",
+        )
+        self.positions_closed_sl = Counter(
+            "polybot_positions_closed_sl_total",
+            "Positions closed by stop-loss",
+        )
+
         # Histograms
         self.trade_pnl = Histogram(
             "polybot_trade_pnl_usd",

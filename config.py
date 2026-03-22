@@ -68,6 +68,42 @@ class Config(BaseSettings):
     vol_multiplier_low: float = Field(default=1.15, ge=1.0, le=1.5)
     vol_multiplier_high: float = Field(default=0.70, ge=0.3, le=1.0)
 
+    # --- Active Trading ---
+    active_trading_enabled: bool = Field(
+        default=False, description="Enable intra-window buy/sell trading"
+    )
+    early_entry_enabled: bool = Field(
+        default=False, description="Allow buying before the standard entry window"
+    )
+    early_entry_min_confidence: float = Field(
+        default=0.75, ge=0.5, le=0.99,
+        description="Minimum confidence to enter early",
+    )
+    early_entry_seconds_before_close: int = Field(
+        default=300, ge=60, le=600,
+        description="Earliest allowed entry (seconds before close)",
+    )
+    take_profit_threshold: float = Field(
+        default=0.10, ge=0.02, le=0.50,
+        description="Absolute price increase to trigger take-profit",
+    )
+    stop_loss_threshold: float = Field(
+        default=0.08, ge=0.02, le=0.30,
+        description="Absolute price decrease to trigger stop-loss",
+    )
+    position_monitor_interval: float = Field(
+        default=3.0, ge=1.0, le=10.0,
+        description="Seconds between position price checks",
+    )
+    max_open_positions: int = Field(
+        default=2, ge=1, le=5,
+        description="Maximum concurrent open positions",
+    )
+    min_sell_seconds_before_close: int = Field(
+        default=10, ge=5, le=60,
+        description="Stop trying to sell within this many seconds of close",
+    )
+
     # --- Risk ---
     stop_loss_pct: float = Field(default=0.30, ge=0.05, le=0.50)
     take_profit_pct: float = Field(default=0.20, ge=0.05, le=0.50)

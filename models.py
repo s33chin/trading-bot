@@ -19,6 +19,8 @@ class TradeAction(str, Enum):
     BUY_UP = "buy_up"
     BUY_DOWN = "buy_down"
     BUY_BOTH = "buy_both"  # arbitrage
+    SELL_UP = "sell_up"
+    SELL_DOWN = "sell_down"
     SKIP = "skip"
 
 
@@ -124,6 +126,21 @@ class OrderBook:
             remaining -= take
             if remaining <= 0:
                 return total_cost / size
+        return None  # not enough liquidity
+
+    def fill_price_bid(self, size: float) -> Optional[float]:
+        """
+        Walk the bid book to find the average fill price for selling `size` shares.
+        Returns None if insufficient liquidity.
+        """
+        remaining = size
+        total_revenue = 0.0
+        for level in self.bids:
+            take = min(remaining, level.size)
+            total_revenue += take * level.price
+            remaining -= take
+            if remaining <= 0:
+                return total_revenue / size
         return None  # not enough liquidity
 
 
@@ -236,6 +253,7 @@ class Trade:
     order_id: Optional[str] = None
     fill_price: Optional[float] = None
     pnl: Optional[float] = None
+    position_id: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
     @property
@@ -247,6 +265,45 @@ class Trade:
         if self.fill_price:
             return (1.0 - self.fill_price) * self.shares
         return (1.0 - self.price) * self.shares
+
+
+# ─────────────────────────────────────────────────────────────
+# Positions (Active Trading)
+# ─────────────────────────────────────────────────────────────
+class PositionStatus(str, Enum):
+    OPEN = "open"
+    CLOSED_TAKE_PROFIT = "closed_take_profit"
+    CLOSED_STOP_LOSS = "closed_stop_loss"
+    CLOSED_MANUAL = "closed_manual"
+    HELD_TO_EXPIRY = "held_to_expiry"
+
+
+@dataclass
+class Position:
+    """An open or closed position — wraps a buy trade with exit tracking."""
+    id: str
+    buy_trade: Trade
+    side: Side
+    token_id: str
+    entry_price: float          # fill_price of the buy
+    shares: float
+    cost: float                 # entry_price * shares
+    status: PositionStatus = PositionStatus.OPEN
+    sell_trade: Optional[Trade] = None
+    take_profit_price: float = 0.0
+    stop_loss_price: float = 0.0
+    opened_at: float = field(default_factory=time.time)
+    closed_at: Optional[float] = None
+    pnl: Optional[float] = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.status == PositionStatus.OPEN
+
+    def compute_exit_prices(self, take_profit_threshold: float, stop_loss_threshold: float) -> None:
+        """Set TP/SL prices as absolute offsets from entry price."""
+        self.take_profit_price = min(0.99, self.entry_price + take_profit_threshold)
+        self.stop_loss_price = max(0.01, self.entry_price - stop_loss_threshold)
 
 
 # ─────────────────────────────────────────────────────────────

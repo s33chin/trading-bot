@@ -30,9 +30,12 @@ from models import (
     DailyStats,
     FusedSignal,
     Market,
+    Position,
+    PositionStatus,
     Side,
     Trade,
     TradeAction,
+    TradeStatus,
 )
 from monitoring import Metrics
 from strategies import ArbitrageStrategy, FusionStrategy, MomentumStrategy
@@ -73,6 +76,9 @@ class TradingBot:
         self._max_observation_snapshots = 250
         # Track fire-and-forget tasks to prevent silent failures
         self._background_tasks: set[asyncio.Task] = set()
+        # Active trading: open/closed positions within the current window
+        self._open_positions: list[Position] = []
+        self._closed_positions: list[Position] = []
 
         # BTC price callback
         self.binance.on_price(self._on_btc_price)
@@ -316,8 +322,26 @@ class TradingBot:
 
         self.metrics.update_risk(self.risk.get_status())
 
+        # ── Active trading: monitor open positions for TP/SL ──
+        if self._open_positions:
+            await self._monitor_positions(market, up_book, down_book)
+
+        # ── Active trading: early entry if confidence is very high ──
+        if (
+            self.config.active_trading_enabled
+            and self.config.early_entry_enabled
+            and remaining <= self.config.early_entry_seconds_before_close
+            and remaining > entry_at + 5  # Don't overlap with normal entry phase
+            and not self._open_positions  # Don't stack early entries
+        ):
+            await self._try_early_entry(market, up_book, down_book)
+
         # Sleep until next observation
-        await asyncio.sleep(min(poll_interval, max(1, remaining - entry_at - 2)))
+        sleep_time = min(poll_interval, max(1, remaining - entry_at - 2))
+        # Monitor positions more frequently if any are open
+        if self._open_positions:
+            sleep_time = min(sleep_time, self.config.position_monitor_interval)
+        await asyncio.sleep(sleep_time)
 
     async def _evaluate_and_trade(self, market: Market) -> None:
         """
@@ -494,6 +518,43 @@ class TradingBot:
             )
             await self.alerts.send_trade(trade)
 
+            # Active trading: wrap filled directional buys in Position
+            if (
+                self.config.active_trading_enabled
+                and trade.status == TradeStatus.FILLED
+                and trade.action not in (TradeAction.BUY_BOTH, TradeAction.SKIP)
+                and trade.fill_price is not None
+            ):
+                position = Position(
+                    id=trade.id,
+                    buy_trade=trade,
+                    side=trade.side,
+                    token_id=trade.token_id,
+                    entry_price=trade.fill_price,
+                    shares=trade.shares,
+                    cost=trade.fill_price * trade.shares,
+                )
+                position.compute_exit_prices(
+                    self.config.take_profit_threshold,
+                    self.config.stop_loss_threshold,
+                )
+                self._open_positions.append(position)
+                self.risk.add_exposure(position.cost)
+                self.metrics.open_positions.set(len(self._open_positions))
+                log.info(
+                    "position_opened",
+                    side=position.side.value,
+                    entry=f"${position.entry_price:.4f}",
+                    tp=f"${position.take_profit_price:.4f}",
+                    sl=f"${position.stop_loss_price:.4f}",
+                    shares=f"{position.shares:.1f}",
+                )
+                await self.alerts.send_position_opened(position)
+
+        # Monitor existing positions for TP/SL
+        if self._open_positions:
+            await self._monitor_positions(market, up_book, down_book)
+
         await asyncio.sleep(2)  # Don't spam orders
 
     def _apply_observation_boost(self, signal: FusedSignal) -> FusedSignal:
@@ -570,8 +631,25 @@ class TradingBot:
         else:
             log.info("market_resolved", winner=winning_side.value, trades=trade_count)
 
-            # Resolve all trades for this window
+            # Mark remaining open positions as held-to-expiry
+            for position in self._open_positions:
+                position.status = PositionStatus.HELD_TO_EXPIRY
+                position.closed_at = time.time()
+                self.risk.remove_exposure(position.cost)
+
+            # Resolve trades that were NOT already closed by a mid-window sell.
+            # Trades with pnl already set (from a sell) are skipped.
             for trade in self._window_trades:
+                if trade.pnl is not None:
+                    # Already settled by a mid-window sell — just record stats
+                    self.metrics.record_trade(
+                        strategy=trade.strategy.value,
+                        side=trade.side.value,
+                        status="won" if trade.pnl > 0 else "lost",
+                        pnl=trade.pnl,
+                    )
+                    continue
+
                 self.execution.resolve_trade(trade, winning_side)
                 self.risk.record_trade(trade)
                 self._update_daily_stats(trade)
@@ -599,12 +677,15 @@ class TradingBot:
             )
 
         self.metrics.update_risk(self.risk.get_status())
+        self.metrics.open_positions.set(0)
 
         # ── Clean slate for next window ──
         # This is critical: setting _current_market = None tells the
         # main loop to search for the next market on the next iteration.
         self._window_trades = []
         self._observation_snapshots = []
+        self._open_positions = []
+        self._closed_positions = []
         self._current_window = BTCWindow()
         self._current_market = None
 
@@ -651,6 +732,8 @@ class TradingBot:
 
         self._window_trades = []
         self._observation_snapshots = []
+        self._open_positions = []
+        self._closed_positions = []
         self.metrics.markets_processed.inc()
 
         self._create_tracked_task(
@@ -694,6 +777,265 @@ class TradingBot:
                 self._daily_stats.losses += 1
                 self._daily_stats.largest_loss = min(
                     self._daily_stats.largest_loss, trade.pnl
+                )
+
+        self.metrics.win_rate.set(self._daily_stats.win_rate)
+
+    # ── Active Trading ─────────────────────────────────────
+
+    async def _monitor_positions(
+        self,
+        market: Market,
+        up_book: Optional["OrderBook"] = None,
+        down_book: Optional["OrderBook"] = None,
+    ) -> None:
+        """
+        Check all open positions for take-profit or stop-loss triggers.
+        Uses pre-fetched order books if available, otherwise fetches fresh ones.
+        """
+        if not self._open_positions:
+            return
+
+        # Don't try to sell too close to expiry — let it resolve at binary price
+        if market.seconds_remaining < self.config.min_sell_seconds_before_close:
+            return
+
+        if up_book is None or down_book is None:
+            up_book, down_book = await self.polymarket.fetch_orderbooks(market)
+
+        for position in list(self._open_positions):
+            book = up_book if position.side == Side.UP else down_book
+            if not book or book.best_bid is None:
+                continue
+
+            current_bid = book.best_bid
+
+            if current_bid >= position.take_profit_price:
+                log.info(
+                    "take_profit_triggered",
+                    side=position.side.value,
+                    entry=f"${position.entry_price:.4f}",
+                    bid=f"${current_bid:.4f}",
+                    tp=f"${position.take_profit_price:.4f}",
+                )
+                await self._close_position(position, market, book, "take_profit")
+            elif current_bid <= position.stop_loss_price:
+                log.info(
+                    "stop_loss_triggered",
+                    side=position.side.value,
+                    entry=f"${position.entry_price:.4f}",
+                    bid=f"${current_bid:.4f}",
+                    sl=f"${position.stop_loss_price:.4f}",
+                )
+                await self._close_position(position, market, book, "stop_loss")
+
+    async def _close_position(
+        self, position: Position, market: Market, book, reason: str
+    ) -> None:
+        """Sell tokens to close a position (take-profit or stop-loss)."""
+        sell_trade = await self.execution.execute_sell(
+            position=position,
+            market=market,
+            book=book,
+        )
+        if sell_trade and sell_trade.status == TradeStatus.FILLED:
+            sell_revenue = sell_trade.fill_price * sell_trade.shares
+            position.pnl = sell_revenue - position.cost
+            position.status = (
+                PositionStatus.CLOSED_TAKE_PROFIT
+                if reason == "take_profit"
+                else PositionStatus.CLOSED_STOP_LOSS
+            )
+            position.sell_trade = sell_trade
+            position.closed_at = time.time()
+
+            # Move from open to closed
+            if position in self._open_positions:
+                self._open_positions.remove(position)
+            self._closed_positions.append(position)
+            self.risk.remove_exposure(position.cost)
+            self.metrics.open_positions.set(len(self._open_positions))
+
+            # Record the sell P&L on the original buy trade so resolution skips it
+            position.buy_trade.pnl = position.pnl
+
+            # Track in window trades and stats
+            self._window_trades.append(sell_trade)
+            self._all_trades.append(sell_trade)
+            self.risk.record_trade(sell_trade)
+            self._update_daily_stats_from_position(position)
+
+            self.metrics.record_trade(
+                strategy=sell_trade.strategy.value,
+                side=sell_trade.side.value,
+                status="won" if position.pnl > 0 else "lost",
+                pnl=position.pnl,
+            )
+
+            if reason == "take_profit":
+                self.metrics.positions_closed_tp.inc()
+            else:
+                self.metrics.positions_closed_sl.inc()
+
+            log.info(
+                "position_closed",
+                reason=reason,
+                side=position.side.value,
+                entry=f"${position.entry_price:.4f}",
+                exit=f"${sell_trade.fill_price:.4f}",
+                pnl=f"${position.pnl:+.4f}",
+                shares=f"{position.shares:.1f}",
+            )
+            await self.alerts.send_position_closed(position, reason)
+        else:
+            log.warning(
+                "position_close_failed",
+                reason=reason,
+                side=position.side.value,
+                sell_status=sell_trade.status.value if sell_trade else "no_trade",
+            )
+
+    async def _try_early_entry(
+        self, market: Market, up_book, down_book
+    ) -> None:
+        """
+        Attempt early entry during observation phase when confidence is very high.
+        Only triggers when active_trading_enabled and early_entry_enabled are True.
+        """
+        # Check position limits
+        can_open, reason = self.risk.can_open_position(len(self._open_positions))
+        if not can_open:
+            return
+
+        can_trade, reason = self.risk.can_trade()
+        if not can_trade:
+            return
+
+        # Evaluate signals
+        klines = await self.binance.get_klines(interval="1m", limit=10)
+        strategy_name = self.config.strategy
+        best_signal: Optional[FusedSignal] = None
+
+        if strategy_name in (Strategy.MOMENTUM, Strategy.ALL):
+            # Override entry timing check — we're doing early entry
+            mom = self.momentum
+            delta = self._current_window.delta
+            if delta is not None and abs(delta) >= mom.min_delta / 100:
+                direction = Side.UP if delta > 0 else Side.DOWN
+                book = up_book if direction == Side.UP else down_book
+                if book and book.best_ask and book.best_ask <= mom.max_token_price:
+                    confidence = min(0.95, 0.4 + abs(delta) * 100 * 3.0)
+                    if confidence >= self.config.early_entry_min_confidence:
+                        from models import Signal, StrategySource
+                        best_signal = FusedSignal(
+                            action=TradeAction.BUY_UP if direction == Side.UP else TradeAction.BUY_DOWN,
+                            direction=direction,
+                            confidence=confidence,
+                            signals=[Signal(
+                                name="early_momentum",
+                                direction=direction,
+                                confidence=confidence,
+                                source=StrategySource.MOMENTUM,
+                            )],
+                            reason=f"early entry: confidence {confidence:.2%}",
+                        )
+
+        if strategy_name in (Strategy.FUSION, Strategy.ALL):
+            # Use fusion with a higher confidence bar
+            fusion_signal = self.fusion.evaluate(
+                market, self._current_window, up_book, down_book, klines
+            )
+            if (
+                fusion_signal.action != TradeAction.SKIP
+                and fusion_signal.confidence >= self.config.early_entry_min_confidence
+            ):
+                if best_signal is None or fusion_signal.confidence > best_signal.confidence:
+                    best_signal = fusion_signal
+                    best_signal.reason = f"early entry (fusion): {best_signal.reason}"
+
+        if best_signal is None or best_signal.action == TradeAction.SKIP:
+            return
+
+        # Execute early entry
+        size = self.risk.position_size(best_signal.confidence)
+        ok, reason = self.risk.check_trade_size(size)
+        if not ok:
+            return
+
+        remaining = market.seconds_remaining
+        log.info(
+            "early_entry_executing",
+            action=best_signal.action.value,
+            confidence=f"{best_signal.confidence:.2%}",
+            remaining=f"{remaining:.0f}s",
+            size=f"${size:.2f}",
+        )
+
+        trades = await self.execution.execute(
+            best_signal, market, up_book, down_book, size
+        )
+
+        for trade in trades:
+            self._window_trades.append(trade)
+            self._all_trades.append(trade)
+            self.metrics.record_trade(
+                strategy=trade.strategy.value,
+                side=trade.side.value,
+                status=trade.status.value,
+            )
+            await self.alerts.send_trade(trade)
+
+            # Wrap in Position for monitoring
+            if (
+                trade.status == TradeStatus.FILLED
+                and trade.action not in (TradeAction.BUY_BOTH, TradeAction.SKIP)
+                and trade.fill_price is not None
+            ):
+                position = Position(
+                    id=trade.id,
+                    buy_trade=trade,
+                    side=trade.side,
+                    token_id=trade.token_id,
+                    entry_price=trade.fill_price,
+                    shares=trade.shares,
+                    cost=trade.fill_price * trade.shares,
+                )
+                position.compute_exit_prices(
+                    self.config.take_profit_threshold,
+                    self.config.stop_loss_threshold,
+                )
+                self._open_positions.append(position)
+                self.risk.add_exposure(position.cost)
+                self.metrics.open_positions.set(len(self._open_positions))
+                log.info(
+                    "early_position_opened",
+                    side=position.side.value,
+                    entry=f"${position.entry_price:.4f}",
+                    tp=f"${position.take_profit_price:.4f}",
+                    sl=f"${position.stop_loss_price:.4f}",
+                )
+                await self.alerts.send_position_opened(position)
+
+    def _update_daily_stats_from_position(self, position: Position) -> None:
+        """Update daily stats from a closed position."""
+        today = date.today().isoformat()
+        if self._daily_stats.date != today:
+            self._daily_stats = DailyStats(date=today)
+
+        self._daily_stats.total_trades += 1
+        self._daily_stats.total_invested += position.cost
+
+        if position.pnl is not None:
+            self._daily_stats.total_pnl += position.pnl
+            if position.pnl > 0:
+                self._daily_stats.wins += 1
+                self._daily_stats.largest_win = max(
+                    self._daily_stats.largest_win, position.pnl
+                )
+            else:
+                self._daily_stats.losses += 1
+                self._daily_stats.largest_loss = min(
+                    self._daily_stats.largest_loss, position.pnl
                 )
 
         self.metrics.win_rate.set(self._daily_stats.win_rate)

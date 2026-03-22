@@ -715,3 +715,207 @@ class TestFusionConfidenceAggregation:
         # the fusion should produce a non-trivial confidence
         if result.action != TradeAction.SKIP:
             assert result.confidence > 0.4
+
+
+# ── Active Trading Tests ─────────────────────────────────
+
+from models import Position, PositionStatus
+
+
+class TestPosition:
+
+    def test_compute_exit_prices(self):
+        now = time.time()
+        m = Market("c", "q", "u", "d", now + 100, now, "s")
+        trade = Trade(
+            id="t1", market=m, action=TradeAction.BUY_UP,
+            side=Side.UP, token_id="u", price=0.55,
+            size=1.0, shares=1.82, fill_price=0.55,
+            status=TradeStatus.FILLED,
+        )
+        pos = Position(
+            id="p1", buy_trade=trade, side=Side.UP,
+            token_id="u", entry_price=0.55, shares=1.82,
+            cost=0.55 * 1.82,
+        )
+        pos.compute_exit_prices(take_profit_threshold=0.10, stop_loss_threshold=0.08)
+        assert abs(pos.take_profit_price - 0.65) < 0.001
+        assert abs(pos.stop_loss_price - 0.47) < 0.001
+
+    def test_tp_clamped_to_099(self):
+        now = time.time()
+        m = Market("c", "q", "u", "d", now + 100, now, "s")
+        trade = Trade(
+            id="t2", market=m, action=TradeAction.BUY_UP,
+            side=Side.UP, token_id="u", price=0.95,
+            size=1.0, shares=1.05, fill_price=0.95,
+            status=TradeStatus.FILLED,
+        )
+        pos = Position(
+            id="p2", buy_trade=trade, side=Side.UP,
+            token_id="u", entry_price=0.95, shares=1.05,
+            cost=0.95 * 1.05,
+        )
+        pos.compute_exit_prices(take_profit_threshold=0.10, stop_loss_threshold=0.08)
+        assert pos.take_profit_price == 0.99
+
+    def test_sl_clamped_to_001(self):
+        now = time.time()
+        m = Market("c", "q", "u", "d", now + 100, now, "s")
+        trade = Trade(
+            id="t3", market=m, action=TradeAction.BUY_DOWN,
+            side=Side.DOWN, token_id="d", price=0.05,
+            size=1.0, shares=20.0, fill_price=0.05,
+            status=TradeStatus.FILLED,
+        )
+        pos = Position(
+            id="p3", buy_trade=trade, side=Side.DOWN,
+            token_id="d", entry_price=0.05, shares=20.0,
+            cost=0.05 * 20.0,
+        )
+        pos.compute_exit_prices(take_profit_threshold=0.10, stop_loss_threshold=0.08)
+        assert pos.stop_loss_price == 0.01
+
+    def test_position_is_open(self):
+        now = time.time()
+        m = Market("c", "q", "u", "d", now + 100, now, "s")
+        trade = Trade(
+            id="t4", market=m, action=TradeAction.BUY_UP,
+            side=Side.UP, token_id="u", price=0.55,
+            size=1.0, shares=1.82, fill_price=0.55,
+            status=TradeStatus.FILLED,
+        )
+        pos = Position(
+            id="p4", buy_trade=trade, side=Side.UP,
+            token_id="u", entry_price=0.55, shares=1.82,
+            cost=1.0,
+        )
+        assert pos.is_open
+        pos.status = PositionStatus.CLOSED_TAKE_PROFIT
+        assert not pos.is_open
+
+
+class TestOrderBookFillPriceBid:
+
+    def test_fill_price_bid_walks_book(self):
+        book = OrderBook(
+            bids=[
+                OrderBookLevel(0.60, 10),
+                OrderBookLevel(0.55, 20),
+                OrderBookLevel(0.50, 30),
+            ]
+        )
+        fill = book.fill_price_bid(15)
+        assert fill is not None
+        expected = (10 * 0.60 + 5 * 0.55) / 15
+        assert abs(fill - expected) < 0.001
+
+    def test_fill_price_bid_insufficient_liquidity(self):
+        book = OrderBook(bids=[OrderBookLevel(0.60, 5)])
+        fill = book.fill_price_bid(100)
+        assert fill is None
+
+
+class TestSellExecution:
+
+    def test_simulate_sell_no_slippage(self, config, market):
+        config.paper_slippage_pct = 0.0
+        from execution.engine import ExecutionEngine
+        engine = ExecutionEngine(config)
+        now = time.time()
+        buy_trade = Trade(
+            id="buy1", market=market, action=TradeAction.BUY_UP,
+            side=Side.UP, token_id="up-token-abc", price=0.55,
+            size=1.0, shares=1.82, fill_price=0.55,
+            status=TradeStatus.FILLED,
+        )
+        pos = Position(
+            id="pos1", buy_trade=buy_trade, side=Side.UP,
+            token_id="up-token-abc", entry_price=0.55, shares=1.82,
+            cost=0.55 * 1.82,
+        )
+        sell_trade = Trade(
+            id="sell1", market=market, action=TradeAction.SELL_UP,
+            side=Side.UP, token_id="up-token-abc", price=0.65,
+            size=0.65 * 1.82, shares=1.82,
+        )
+        result = engine._simulate_sell_fill(sell_trade)
+        assert result.status == TradeStatus.FILLED
+        assert result.fill_price == 0.65
+
+    def test_simulate_sell_with_slippage(self, config, market):
+        config.paper_slippage_pct = 1.0
+        from execution.engine import ExecutionEngine
+        engine = ExecutionEngine(config)
+        sell_trade = Trade(
+            id="sell2", market=market, action=TradeAction.SELL_UP,
+            side=Side.UP, token_id="up-token-abc", price=0.65,
+            size=0.65 * 1.82, shares=1.82,
+        )
+        result = engine._simulate_sell_fill(sell_trade)
+        assert result.status == TradeStatus.FILLED
+        assert result.fill_price <= 0.65  # Adverse slippage for sells
+
+    def test_sell_pnl_take_profit(self):
+        """Buy at 0.55, sell at 0.65 → positive P&L."""
+        entry_price = 0.55
+        shares = 10.0
+        cost = entry_price * shares  # $5.50
+        sell_price = 0.65
+        revenue = sell_price * shares  # $6.50
+        pnl = revenue - cost  # +$1.00
+        assert pnl > 0
+        assert abs(pnl - 1.0) < 0.001
+
+    def test_sell_pnl_stop_loss(self):
+        """Buy at 0.55, sell at 0.47 → negative P&L."""
+        entry_price = 0.55
+        shares = 10.0
+        cost = entry_price * shares  # $5.50
+        sell_price = 0.47
+        revenue = sell_price * shares  # $4.70
+        pnl = revenue - cost  # -$0.80
+        assert pnl < 0
+        assert abs(pnl - (-0.80)) < 0.001
+
+
+class TestRiskManagerPositions:
+
+    def test_can_open_position_within_limit(self, config):
+        config.max_open_positions = 2
+        rm = RiskManager(config)
+        allowed, _ = rm.can_open_position(0)
+        assert allowed is True
+        allowed, _ = rm.can_open_position(1)
+        assert allowed is True
+
+    def test_cannot_open_position_at_limit(self, config):
+        config.max_open_positions = 2
+        rm = RiskManager(config)
+        allowed, reason = rm.can_open_position(2)
+        assert allowed is False
+        assert "max open positions" in reason
+
+    def test_exposure_tracking(self, config):
+        rm = RiskManager(config)
+        rm.add_exposure(5.0)
+        assert rm.state.current_exposure == 5.0
+        rm.add_exposure(3.0)
+        assert rm.state.current_exposure == 8.0
+        rm.remove_exposure(5.0)
+        assert rm.state.current_exposure == 3.0
+        rm.remove_exposure(10.0)  # Should clamp to 0
+        assert rm.state.current_exposure == 0.0
+
+
+class TestActiveTradeActions:
+
+    def test_sell_actions_exist(self):
+        assert TradeAction.SELL_UP == "sell_up"
+        assert TradeAction.SELL_DOWN == "sell_down"
+
+    def test_config_defaults_preserve_existing_behavior(self):
+        """Default config should have active trading disabled."""
+        config = Config()
+        assert config.active_trading_enabled is False
+        assert config.early_entry_enabled is False

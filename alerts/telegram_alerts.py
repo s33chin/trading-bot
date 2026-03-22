@@ -14,7 +14,7 @@ from typing import Optional
 
 from config import AlertLevel, Config
 from logger import get_logger
-from models import BTCWindow, DailyStats, FusedSignal, Market, Side, Trade
+from models import BTCWindow, DailyStats, FusedSignal, Market, Position, Side, Trade
 
 log = get_logger("alerts.telegram")
 
@@ -162,6 +162,40 @@ class TelegramAlerter:
             f"⚠️ <b>Market Resolved — Unknown Winner</b>\n"
             f"├ Market: <code>{market.slug}</code>\n"
             f"└ Could not determine BTC direction"
+        )
+        await self._send(msg)
+
+    # ── Position Notifications (Active Trading) ─────────
+
+    async def send_position_opened(self, position: Position) -> None:
+        """Notify when a position is opened with TP/SL levels."""
+        if not self._should_send("trade"):
+            return
+        msg = (
+            f"📌 <b>Position Opened</b>\n"
+            f"├ Side: <code>{position.side.value.upper()}</code>\n"
+            f"├ Entry: <code>${position.entry_price:.4f}</code>\n"
+            f"├ Shares: <code>{position.shares:.1f}</code>\n"
+            f"├ Cost: <code>${position.cost:.4f}</code>\n"
+            f"├ TP: <code>${position.take_profit_price:.4f}</code>\n"
+            f"└ SL: <code>${position.stop_loss_price:.4f}</code>"
+        )
+        await self._send(msg)
+
+    async def send_position_closed(self, position: Position, reason: str) -> None:
+        """Notify when a position is closed by TP/SL."""
+        if not self._should_send("trade"):
+            return
+        emoji = "💰" if (position.pnl or 0) >= 0 else "💸"
+        reason_label = "Take Profit" if reason == "take_profit" else "Stop Loss"
+        exit_price = position.sell_trade.fill_price if position.sell_trade else "N/A"
+        msg = (
+            f"{emoji} <b>Position Closed — {reason_label}</b>\n"
+            f"├ Side: <code>{position.side.value.upper()}</code>\n"
+            f"├ Entry: <code>${position.entry_price:.4f}</code>\n"
+            f"├ Exit: <code>${exit_price:.4f}</code>\n"
+            f"├ Shares: <code>{position.shares:.1f}</code>\n"
+            f"└ P&L: <code>${position.pnl:+.4f}</code>"
         )
         await self._send(msg)
 

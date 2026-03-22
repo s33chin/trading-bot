@@ -33,6 +33,7 @@ class RiskState:
     last_loss_time: float = 0.0
     consecutive_losses: int = 0
     total_invested_today: float = 0.0
+    current_exposure: float = 0.0  # Total cost of open positions
 
 
 class RiskManager:
@@ -88,6 +89,21 @@ class RiskManager:
         if size_usd > self.config.max_trade_size:
             return False, f"size ${size_usd:.2f} > max ${self.config.max_trade_size:.2f}"
         return True, "ok"
+
+    def can_open_position(self, current_open: int) -> tuple[bool, str]:
+        """Check if a new position can be opened."""
+        max_pos = self.config.max_open_positions
+        if current_open >= max_pos:
+            return False, f"max open positions reached: {current_open}/{max_pos}"
+        return True, "ok"
+
+    def add_exposure(self, cost: float) -> None:
+        """Track exposure when a position is opened."""
+        self.state.current_exposure += cost
+
+    def remove_exposure(self, cost: float) -> None:
+        """Reduce exposure when a position is closed."""
+        self.state.current_exposure = max(0, self.state.current_exposure - cost)
 
     def record_trade(self, trade: Trade) -> None:
         """Record a completed trade for risk tracking."""

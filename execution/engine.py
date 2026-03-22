@@ -19,6 +19,7 @@ from models import (
     FusedSignal,
     Market,
     OrderBook,
+    Position,
     Side,
     StrategySource,
     Trade,
@@ -422,6 +423,124 @@ class ExecutionEngine:
             winner=winning_side.value,
             pnl=f"${trade.pnl:+.4f}",
             fill_price=f"${trade.fill_price:.4f}" if trade.fill_price else "N/A",
+        )
+        return trade
+
+    # ── Sell Execution (Active Trading) ─────────────────────
+
+    async def execute_sell(
+        self,
+        position: Position,
+        market: Market,
+        book: OrderBook,
+    ) -> Trade | None:
+        """
+        Sell tokens from an open position.
+        Uses bid price (not ask) since we're selling.
+        """
+        if book.best_bid is None:
+            log.warning("sell_no_bid", side=position.side.value)
+            return None
+
+        # Check liquidity at desired size
+        avg_bid = book.fill_price_bid(position.shares)
+        if avg_bid is None:
+            log.warning(
+                "sell_insufficient_liquidity",
+                side=position.side.value,
+                shares=f"{position.shares:.1f}",
+            )
+            return None
+
+        price = avg_bid
+        action = TradeAction.SELL_UP if position.side == Side.UP else TradeAction.SELL_DOWN
+
+        trade = Trade(
+            id=str(uuid.uuid4())[:8],
+            market=market,
+            action=action,
+            side=position.side,
+            token_id=position.token_id,
+            price=price,
+            size=price * position.shares,
+            shares=position.shares,
+            strategy=position.buy_trade.strategy,
+            position_id=position.id,
+        )
+
+        if self.config.is_live:
+            return await self._place_live_sell_order(trade)
+        else:
+            return self._simulate_sell_fill(trade)
+
+    async def _place_live_sell_order(self, trade: Trade) -> Trade:
+        """Place a SELL order on Polymarket CLOB."""
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+
+            order_args = OrderArgs(
+                price=trade.price,
+                size=trade.shares,
+                side="SELL",
+                token_id=trade.token_id,
+            )
+
+            signed_order = await asyncio.to_thread(
+                self._clob_client.create_order, order_args
+            )
+            response = await asyncio.to_thread(
+                self._clob_client.post_order, signed_order, OrderType.GTC
+            )
+
+            if not response or not response.get("success"):
+                trade.status = TradeStatus.FAILED
+                error_msg = response.get("errorMsg", "unknown") if response else "no response"
+                log.error("live_sell_failed", error=error_msg)
+                return trade
+
+            trade.order_id = response.get("orderID", "")
+            trade.status = TradeStatus.PENDING
+            log.info(
+                "live_sell_placed",
+                order_id=trade.order_id,
+                side=trade.side.value,
+                price=f"${trade.price:.4f}",
+                shares=f"{trade.shares:.1f}",
+            )
+
+            trade = await self._wait_for_fill(trade)
+
+        except Exception as e:
+            trade.status = TradeStatus.FAILED
+            log.error("live_sell_exception", error=str(e))
+
+        return trade
+
+    def _simulate_sell_fill(self, trade: Trade) -> Trade:
+        """
+        Simulate a paper sell with slippage against the bid.
+        Slippage is adverse for sells (lower fill price).
+        """
+        slippage_pct = self.config.paper_slippage_pct / 100.0
+        if slippage_pct > 0:
+            slippage = trade.price * random.uniform(0, slippage_pct)
+            trade.fill_price = max(0.01, trade.price - slippage)
+        else:
+            trade.fill_price = trade.price
+
+        trade.size = trade.fill_price * trade.shares  # Actual revenue
+        trade.status = TradeStatus.FILLED
+        trade.order_id = f"paper-sell-{trade.id}"
+        self._paper_trades.append(trade)
+
+        log.info(
+            "paper_sell_filled",
+            side=trade.side.value,
+            bid_price=f"${trade.price:.4f}",
+            fill_price=f"${trade.fill_price:.4f}",
+            slippage=f"${(trade.price - trade.fill_price):.4f}" if slippage_pct > 0 else "$0",
+            shares=f"{trade.shares:.1f}",
+            revenue=f"${trade.size:.4f}",
         )
         return trade
 
