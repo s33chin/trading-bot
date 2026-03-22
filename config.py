@@ -34,7 +34,7 @@ class AlertLevel(str, Enum):
 class Config(BaseSettings):
     """Bot configuration — all values from .env or environment variables."""
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # --- Polymarket Credentials ---
     polymarket_private_key: str = Field(default="", description="Polygon private key")
@@ -61,10 +61,12 @@ class Config(BaseSettings):
 
     # --- Fusion Strategy ---
     weight_delta: float = Field(default=0.50)
-    weight_orderbook: float = Field(default=0.20)
-    weight_volatility: float = Field(default=0.15)
-    weight_momentum: float = Field(default=0.15)
+    weight_order_flow: float = Field(default=0.20)
+    weight_divergence: float = Field(default=0.20)
+    weight_spread: float = Field(default=0.10)
     min_fusion_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    vol_multiplier_low: float = Field(default=1.15, ge=1.0, le=1.5)
+    vol_multiplier_high: float = Field(default=0.70, ge=0.3, le=1.0)
 
     # --- Risk ---
     stop_loss_pct: float = Field(default=0.30, ge=0.05, le=0.50)
@@ -97,7 +99,7 @@ class Config(BaseSettings):
     # --- General ---
     log_level: str = Field(default="INFO")
 
-    @field_validator("weight_delta", "weight_orderbook", "weight_volatility", "weight_momentum")
+    @field_validator("weight_delta", "weight_order_flow", "weight_divergence", "weight_spread")
     @classmethod
     def weights_must_be_positive(cls, v: float) -> float:
         if v < 0:
@@ -108,15 +110,15 @@ class Config(BaseSettings):
     def validate_fusion_weights_sum(self) -> "Config":
         weight_sum = (
             self.weight_delta
-            + self.weight_orderbook
-            + self.weight_volatility
-            + self.weight_momentum
+            + self.weight_order_flow
+            + self.weight_divergence
+            + self.weight_spread
         )
         if abs(weight_sum - 1.0) > 0.01:
             raise ValueError(
                 f"Fusion strategy weights must sum to 1.0, got {weight_sum:.4f} "
-                f"(delta={self.weight_delta}, orderbook={self.weight_orderbook}, "
-                f"volatility={self.weight_volatility}, momentum={self.weight_momentum})"
+                f"(delta={self.weight_delta}, order_flow={self.weight_order_flow}, "
+                f"divergence={self.weight_divergence}, spread={self.weight_spread})"
             )
         return self
 
@@ -124,9 +126,9 @@ class Config(BaseSettings):
     def fusion_weights_sum(self) -> float:
         return (
             self.weight_delta
-            + self.weight_orderbook
-            + self.weight_volatility
-            + self.weight_momentum
+            + self.weight_order_flow
+            + self.weight_divergence
+            + self.weight_spread
         )
 
     @property

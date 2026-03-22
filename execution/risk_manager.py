@@ -130,11 +130,24 @@ class RiskManager:
         return round(size, 2)
 
     def get_status(self) -> dict:
-        """Return current risk state for monitoring."""
-        self._maybe_reset_daily()
+        """Return current risk state for monitoring (read-only, no side effects)."""
+        today = date.today().isoformat()
+        is_new_day = self.state.current_date != today
+
         now = time.time()
         one_hour_ago = now - 3600
         recent_trades = sum(1 for t in self.state.recent_trade_times if t > one_hour_ago)
+
+        # If it's a new day, report zeroed-out stats without mutating state
+        if is_new_day:
+            return {
+                "daily_pnl": 0.0,
+                "daily_trades": 0,
+                "trades_last_hour": 0,
+                "consecutive_losses": 0,
+                "daily_invested": 0.0,
+                "can_trade": True,
+            }
 
         return {
             "daily_pnl": round(self.state.daily_pnl, 4),

@@ -71,6 +71,8 @@ class TradingBot:
         self._observation_snapshots: list[dict] = []
         # Max snapshots per window: 15min / 5s polling = 180, with headroom
         self._max_observation_snapshots = 250
+        # Track fire-and-forget tasks to prevent silent failures
+        self._background_tasks: set[asyncio.Task] = set()
 
         # BTC price callback
         self.binance.on_price(self._on_btc_price)
@@ -121,12 +123,12 @@ class TradingBot:
             try:
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
             except NotImplementedError:
-                pass  # Windows
+                pass  # Windows — KeyboardInterrupt handled below
 
         try:
             while self._running:
                 await self._main_loop_iteration()
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         except Exception as e:
             log.error("bot_fatal_error", error=str(e))
@@ -401,7 +403,7 @@ class TradingBot:
         # ── Force trade at T-5s if we have any signal at all ──
         # Better to trade at low confidence than miss the window entirely
         if best_signal and best_signal.action == TradeAction.SKIP and remaining < 5:
-            if best_signal.confidence > 0.3 and best_signal.direction:
+            if best_signal.confidence > 0.3 and best_signal.direction is not None:
                 best_signal.action = (
                     TradeAction.BUY_UP
                     if best_signal.direction == Side.UP
@@ -413,7 +415,7 @@ class TradingBot:
                     direction=best_signal.direction.value,
                     confidence=f"{best_signal.confidence:.2%}",
                     remaining=f"{remaining:.0f}s",
-                    paper_force=paper_force,
+                    is_paper=not self.config.is_live,
                 )
 
         # ── Always push signal confidence to Prometheus ──
@@ -651,7 +653,7 @@ class TradingBot:
         self._observation_snapshots = []
         self.metrics.markets_processed.inc()
 
-        asyncio.create_task(
+        self._create_tracked_task(
             self.alerts.send_market_found(
                 market.question, market.seconds_remaining
             )
@@ -661,11 +663,14 @@ class TradingBot:
         """
         Determine if BTC went up or down in this window.
         Compares window open price to current price.
+        Returns None if exactly flat (no winner).
         """
         w = self._current_window
         if w.window_open_price is None or w.current_price is None:
             return None
-        if w.current_price >= w.window_open_price:
+        if w.current_price == w.window_open_price:
+            return None  # Exactly flat — no clear winner
+        if w.current_price > w.window_open_price:
             return Side.UP
         return Side.DOWN
 
@@ -692,3 +697,19 @@ class TradingBot:
                 )
 
         self.metrics.win_rate.set(self._daily_stats.win_rate)
+
+    def _create_tracked_task(self, coro) -> asyncio.Task:
+        """Create an asyncio task and track it to prevent silent failures."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Callback for tracked tasks — log exceptions instead of swallowing them."""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            log.error("background_task_error", error=str(exc), task=task.get_name())

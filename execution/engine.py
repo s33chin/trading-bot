@@ -198,21 +198,27 @@ class ExecutionEngine:
 
             filled_down = await self._place_live_order(down_trade)
             if filled_down.status != TradeStatus.FILLED:
-                log.warning(
-                    "arb_down_leg_failed",
-                    status=filled_down.status.value,
-                    msg="attempting to cancel UP order",
-                )
-                cancelled = await self._cancel_order(filled_up)
-                if cancelled:
-                    filled_up.status = TradeStatus.CANCELLED
-                    log.info("arb_up_leg_cancelled", order_id=filled_up.order_id)
-                else:
+                if filled_up.status == TradeStatus.FILLED:
+                    # UP leg already filled — can't cancel a fill.
+                    # We have an unhedged directional position.
                     log.error(
-                        "arb_up_leg_cancel_failed",
+                        "arb_unhedged_position",
                         order_id=filled_up.order_id,
-                        msg="ORPHANED POSITION — manual intervention required",
+                        msg="UP leg FILLED but DOWN leg failed — "
+                        "ORPHANED DIRECTIONAL POSITION, manual intervention required",
                     )
+                else:
+                    # UP leg still pending — try to cancel
+                    cancelled = await self._cancel_order(filled_up)
+                    if cancelled:
+                        filled_up.status = TradeStatus.CANCELLED
+                        log.info("arb_up_leg_cancelled", order_id=filled_up.order_id)
+                    else:
+                        log.error(
+                            "arb_up_leg_cancel_failed",
+                            order_id=filled_up.order_id,
+                            msg="ORPHANED POSITION — manual intervention required",
+                        )
                 return [filled_up, filled_down]
 
             return [filled_up, filled_down]
@@ -231,9 +237,13 @@ class ExecutionEngine:
                 token_id=trade.token_id,
             )
 
-            signed_order = self._clob_client.create_order(order_args)
-            response = self._clob_client.post_order(
-                signed_order, order_type=OrderType.GTC
+            # py-clob-client calls are synchronous — run in thread to avoid
+            # blocking the event loop (which would freeze price feeds, etc.)
+            signed_order = await asyncio.to_thread(
+                self._clob_client.create_order, order_args
+            )
+            response = await asyncio.to_thread(
+                self._clob_client.post_order, signed_order, OrderType.GTC
             )
 
             if not response or not response.get("success"):
@@ -273,14 +283,20 @@ class ExecutionEngine:
         for attempt in range(ORDER_FILL_POLL_ATTEMPTS):
             await asyncio.sleep(ORDER_FILL_POLL_INTERVAL)
             try:
-                order_info = self._clob_client.get_order(trade.order_id)
+                order_info = await asyncio.to_thread(
+                    self._clob_client.get_order, trade.order_id
+                )
                 if not order_info:
                     continue
 
                 status = order_info.get("status", "").lower()
                 if status in ("matched", "filled"):
                     trade.status = TradeStatus.FILLED
-                    trade.fill_price = float(order_info.get("associate_trades", [{}])[0].get("price", trade.price))
+                    assoc_trades = order_info.get("associate_trades") or []
+                    if assoc_trades and isinstance(assoc_trades[0], dict):
+                        trade.fill_price = float(assoc_trades[0].get("price", trade.price))
+                    else:
+                        trade.fill_price = trade.price
                     log.info(
                         "order_filled",
                         order_id=trade.order_id,
@@ -323,13 +339,17 @@ class ExecutionEngine:
             return False
 
         try:
-            response = self._clob_client.cancel(trade.order_id)
+            response = await asyncio.to_thread(
+                self._clob_client.cancel, trade.order_id
+            )
             if response and (response.get("canceled") or response.get("success")):
                 log.info("order_cancelled", order_id=trade.order_id)
                 return True
 
             # Check if the order no longer exists (already filled/cancelled)
-            order_info = self._clob_client.get_order(trade.order_id)
+            order_info = await asyncio.to_thread(
+                self._clob_client.get_order, trade.order_id
+            )
             if order_info:
                 status = order_info.get("status", "").lower()
                 if status in ("cancelled", "expired"):

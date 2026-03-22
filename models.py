@@ -154,7 +154,7 @@ class BTCWindow:
     @property
     def delta(self) -> Optional[float]:
         """Price change as a fraction (e.g., 0.001 = 0.1%)."""
-        if self.window_open_price and self.current_price:
+        if self.window_open_price is not None and self.current_price is not None and self.window_open_price != 0:
             return (self.current_price - self.window_open_price) / self.window_open_price
         return None
 

@@ -40,6 +40,7 @@ class BinanceFeed:
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
         self._rest_poll_interval = 2.0  # seconds between REST polls
+        self._tasks: list[asyncio.Task] = []
 
     @property
     def last_price(self) -> Optional[BTCPrice]:
@@ -59,18 +60,33 @@ class BinanceFeed:
 
         # Start both loops — REST polls continuously as a safety net,
         # WS provides low-latency updates when connected
-        asyncio.create_task(self._ws_loop())
-        asyncio.create_task(self._rest_poll_loop())
+        self._tasks = [
+            asyncio.create_task(self._ws_loop(), name="binance_ws_loop"),
+            asyncio.create_task(self._rest_poll_loop(), name="binance_rest_poll"),
+        ]
+        for task in self._tasks:
+            task.add_done_callback(self._on_task_done)
         log.info("binance_feed_started")
 
     async def stop(self) -> None:
         """Stop the price feed gracefully."""
         self._running = False
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         if self._session and not self._session.closed:
             await self._session.close()
         log.info("binance_feed_stopped")
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Log exceptions from background tasks instead of swallowing them."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            log.error("binance_task_error", error=str(exc), task=task.get_name())
 
     async def get_price_rest(self) -> Optional[BTCPrice]:
         """Fetch current BTC price via REST (fallback)."""

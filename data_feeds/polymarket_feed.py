@@ -438,7 +438,8 @@ class PolymarketFeed:
             slug=slug,
             neg_risk=neg_risk,
         )
-        self._current_market = market
+        # Don't mutate self._current_market here — let the caller decide.
+        # Previously this caused stale overwrites when trying multiple candidates.
         return market
 
     def _extract_end_timestamp(self, m: dict, slug: str) -> Optional[float]:
